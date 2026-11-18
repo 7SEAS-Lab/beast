@@ -101,6 +101,10 @@ class ERA5Distributed(Dataset):
         Constant masks, of shape ``(n_masks, xlat, xlon)``.
     n_masks : int
         Number of constant masks.
+    constant_masks_cache : dict[torch.device, torch.Tensor]
+        Rank local constant masks in the space of the model input, i.e. cast to
+        `dtype` and transformed with `transform`, by device. Filled by
+        :meth:`input_from_list` on first use.
     in_var : Tuple[int, int]
         Range of variables loaded by this rank.
     in_masks : Tuple[int, int]
@@ -214,6 +218,7 @@ class ERA5Distributed(Dataset):
             self.target_transform = transform
         else:
             self.target_transform = target_transform
+        self.constant_masks_cache: dict[torch.device, torch.Tensor] = {}
 
         try:
             _ = self.__getitem__(0)
@@ -503,27 +508,51 @@ class ERA5Distributed(Dataset):
         masks = np.stack(data, axis=0)
         return masks
 
+    def _get_constant_masks_cached(self, device: torch.device) -> torch.Tensor:
+        """Return the rank local shard of the constant masks, transformed and on `device`.
+
+        Parameters
+        ----------
+        device : torch.device
+            Device the masks are needed on.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(masks of this rank, xlat, longitude shard)``, with the
+            grid size of the transformed input. Shared with the cache, so it
+            must not be modified in place.
+        """
+        if device not in self.constant_masks_cache:
+            masks = self._get_constant_masks().to(self.dtype)
+            if self.transform is not None:
+                masks = self.transform(masks)
+            self.constant_masks_cache[device] = masks.to(device)
+        return self.constant_masks_cache[device]
+
     def input_from_list(self, sample_list: list[torch.Tensor]) -> torch.Tensor:
         """Build a model input from a list of timesteps.
 
         The last `in_timesteps` entries are concatenated along the channel
-        dimension, followed by the constant masks, and padded as in
+        dimension, followed by the (transformed) constant masks, and padded as in
         :meth:`__getitem__`.
 
         Parameters
         ----------
         sample_list : list[torch.Tensor]
-            Batched timesteps, each ``(batch, channel shard, xlat, longitude shard)``.
+            Batched timesteps, each ``(batch, channel shard, xlat, longitude shard)``,
+            with the grid size of the transformed input.
 
         Returns
         -------
         torch.Tensor
-            The model input.
+            The model input, on the device of the timesteps.
         """
         input_samples = sample_list[-self.in_timesteps :]
         batch_dim = input_samples[0].shape[0]
-        cmasks = self._get_constant_masks().unsqueeze(0).repeat(batch_dim, 1, 1, 1)
-        input_samples.append(cmasks.to(self.dtype))
+        cmasks = self._get_constant_masks_cached(input_samples[0].device)
+        cmasks = cmasks.unsqueeze(0).expand(batch_dim, -1, -1, -1)
+        input_samples.append(cmasks)
         input = torch.cat(input_samples, dim=-3)
         return self._padsample(input, self.input_pad_oddrank)
 
@@ -689,6 +718,7 @@ class ERA5Dummy(ERA5Distributed):
             self.target_transform = transform
         else:
             self.target_transform = target_transform
+        self.constant_masks_cache: dict[torch.device, torch.Tensor] = {}
 
     def _get_sample_list(self, idx: int, steps: int) -> list[torch.Tensor]:
         """Generate the samples of ``steps`` consecutive timesteps.

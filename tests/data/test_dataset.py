@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Callable, List, cast
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -633,6 +634,87 @@ class TestDataset:
 
         assert list(x_3.shape) == [n_vars // 2, 20, 20, 2]
         assert list(target_3.shape) == [n_features // 2, 20, 20]
+
+    def test_input_from_list_caches_masks(
+        self,
+        tmp_path_factory: TempPathFactory,
+        cached_mock_zarr: Callable[..., str],
+        device: torch.device,
+    ) -> None:
+        """`input_from_list` transforms the masks once per device and reuses them.
+
+        Runs on the CPU by default. With ``--device cuda`` the states are on the
+        GPU, so it also checks that the masks follow them and that states on the
+        CPU get a separate cached copy.
+        """
+        data_path = tmp_path_factory.mktemp("data")
+        n_masks = 3
+        n_features = 8
+
+        zarr_path = cached_mock_zarr(48, n_features, 120, 240)
+        mask_list = generate_mock_masks(data_path, 120, 240, n_masks)
+        generate_mock_normalization(data_path, n_features)
+
+        downsample = trf.Downsample(factor=6, dims=(-1, -2))
+        dataset = ERA5Distributed(
+            0,
+            1,
+            zarr_path,
+            data_path,
+            mask_list,
+            data_path,
+            time_range=None,
+            dt=6,
+            dtype=torch.float32,
+            dsync_access=False,
+            transform=downsample,
+        )
+
+        expected_masks = downsample(
+            torch.tensor(dataset.constant_masks, dtype=torch.float32)
+        )
+        # Two samples on the downsampled 20 x 40 grid. The first n_features
+        # channels are the states, the rest are the masks.
+        x = torch.stack([dataset[0][0], dataset[1][0]])
+        states = x[:, :n_features].to(device)
+
+        assert dataset.constant_masks_cache == {}
+
+        with patch.object(
+            dataset, "_get_constant_masks", wraps=dataset._get_constant_masks
+        ) as spy:
+            out = dataset.input_from_list([states])
+
+            assert out.device == device
+            assert list(out.shape) == [2, n_features + n_masks, 20, 40]
+            assert list(dataset.constant_masks_cache) == [device]
+            cached = dataset.constant_masks_cache[device]
+            assert cached.device == device
+            assert cached.dtype == torch.float32
+            torch.testing.assert_close(cached.cpu(), expected_masks)
+            torch.testing.assert_close(out[:, :n_features], states)
+            torch.testing.assert_close(
+                out[:, n_features:], cached.expand(2, -1, -1, -1)
+            )
+
+            # A second call, with another batch size, reuses the cached masks
+            out_again = dataset.input_from_list([states[:1]])
+
+        assert list(out_again.shape) == [1, n_features + n_masks, 20, 40]
+        assert spy.call_count == 1
+        assert len(dataset.constant_masks_cache) == 1
+        assert dataset.constant_masks_cache[device].data_ptr() == cached.data_ptr()
+
+        if device.type == "cuda":
+            # States on the CPU get their own copy; the one on the GPU stays as it is
+            out_cpu = dataset.input_from_list([states.cpu()])
+
+            cpu = torch.device("cpu")
+            assert out_cpu.device == cpu
+            assert set(dataset.constant_masks_cache) == {device, cpu}
+            assert dataset.constant_masks_cache[cpu].device == cpu
+            assert dataset.constant_masks_cache[device].data_ptr() == cached.data_ptr()
+            torch.testing.assert_close(out_cpu, out.cpu())
 
 
 class TestEWBEra5:
